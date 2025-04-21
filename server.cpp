@@ -14,7 +14,6 @@ mutex db_mutex;
 sqlite3* db;
 bool voting_active = true;
 
-// Initialize the database
 void initialize_database() {
     lock_guard<mutex> lock(db_mutex);
     string sql = R"(
@@ -37,20 +36,33 @@ void initialize_database() {
         sqlite3_free(errmsg);
     }
 
-    sql = R"(
-        INSERT OR IGNORE INTO candidates (name) VALUES 
-        ('Alice'), 
-        ('Bob'), 
-        ('Charlie');
-    )";
+    vector<string> candidate_names = {
+        "Alice", "Bob", "Charlie", "Diana", "Ethan",
+        "Fiona", "George", "Hannah", "Isaac", "Julia"
+    };
 
-    if (sqlite3_exec(db, sql.c_str(), nullptr, nullptr, &errmsg) != SQLITE_OK) {
+    string candidate_insert = "INSERT OR IGNORE INTO candidates (name) VALUES ";
+    for (size_t i = 0; i < candidate_names.size(); ++i) {
+        candidate_insert += "('" + candidate_names[i] + "')";
+        if (i < candidate_names.size() - 1) candidate_insert += ", ";
+        else candidate_insert += ";";
+    }
+
+    if (sqlite3_exec(db, candidate_insert.c_str(), nullptr, nullptr, &errmsg) != SQLITE_OK) {
         cerr << "Error inserting candidates: " << errmsg << endl;
         sqlite3_free(errmsg);
     }
 }
 
-// Return current vote counts as a string
+void reset_votes() {
+    lock_guard<mutex> lock(db_mutex);
+    char* errmsg;
+    if (sqlite3_exec(db, "DELETE FROM votes;", nullptr, nullptr, &errmsg) != SQLITE_OK) {
+        cerr << "Error resetting votes: " << errmsg << endl;
+        sqlite3_free(errmsg);
+    }
+}
+
 string get_vote_counts() {
     string result = "\nCurrent Vote Counts:\n";
     sqlite3_stmt* stmt;
@@ -70,14 +82,12 @@ string get_vote_counts() {
     return result;
 }
 
-// Process a vote
 string process_vote(const string& client_id, const string& candidate) {
     lock_guard<mutex> lock(db_mutex);
 
     sqlite3_stmt* stmt;
     string query;
 
-    // Check valid candidate
     query = "SELECT COUNT(*) FROM candidates WHERE name = ?";
     sqlite3_prepare_v2(db, query.c_str(), -1, &stmt, nullptr);
     sqlite3_bind_text(stmt, 1, candidate.c_str(), -1, SQLITE_STATIC);
@@ -87,7 +97,6 @@ string process_vote(const string& client_id, const string& candidate) {
     }
     sqlite3_finalize(stmt);
 
-    // Check if already voted
     query = "SELECT COUNT(*) FROM votes WHERE client_id = ?";
     sqlite3_prepare_v2(db, query.c_str(), -1, &stmt, nullptr);
     sqlite3_bind_text(stmt, 1, client_id.c_str(), -1, SQLITE_STATIC);
@@ -97,7 +106,6 @@ string process_vote(const string& client_id, const string& candidate) {
     }
     sqlite3_finalize(stmt);
 
-    // Record vote
     query = "INSERT INTO votes (client_id, candidate) VALUES (?, ?)";
     sqlite3_prepare_v2(db, query.c_str(), -1, &stmt, nullptr);
     sqlite3_bind_text(stmt, 1, client_id.c_str(), -1, SQLITE_STATIC);
@@ -108,15 +116,13 @@ string process_vote(const string& client_id, const string& candidate) {
     }
     sqlite3_finalize(stmt);
 
-    return "Vote recorded successfully for: " + candidate + "\n" + get_vote_counts();
+    return "Vote recorded for: " + candidate + "\n" + get_vote_counts();
 }
 
-// Declare the winner
 void declare_winner() {
     lock_guard<mutex> lock(db_mutex);
-    cout << "\nVoting has ended. Final Results:\n";
-    string results = get_vote_counts();
-    cout << results;
+    cout << "\nVoting session ended. Final Results:\n";
+    cout << get_vote_counts();
 
     sqlite3_stmt* stmt;
     string query = R"(
@@ -135,10 +141,8 @@ void declare_winner() {
         cout << "\nNo votes were cast.\n";
     }
     sqlite3_finalize(stmt);
-    voting_active = false;
 }
 
-// Handle client connection
 void handle_connection(tcp::socket socket) {
     try {
         boost::asio::streambuf buffer;
@@ -150,7 +154,7 @@ void handle_connection(tcp::socket socket) {
         getline(input, candidate);
 
         if (!voting_active) {
-            boost::asio::write(socket, boost::asio::buffer("Voting has ended.\n"));
+            boost::asio::write(socket, boost::asio::buffer("Voting is currently closed.\n"));
             return;
         }
 
@@ -158,33 +162,38 @@ void handle_connection(tcp::socket socket) {
         boost::asio::write(socket, boost::asio::buffer(response));
     }
     catch (...) {
-        cerr << "Error handling client connection.\n";
+        cerr << "Client handling error.\n";
     }
 }
 
 int main() {
     sqlite3_open("voting.db", &db);
     initialize_database();
+    reset_votes();
 
     boost::asio::io_context io_context;
     tcp::acceptor acceptor(io_context, tcp::endpoint(tcp::v4(), 54000));
 
-    cout << "Server started on port 54000...\n";
+    cout << "Voting Server started on port 54000...\nVoting will run for 2 minutes...\n";
+    auto start_time = chrono::steady_clock::now();
 
-    // End voting in 2 minutes
-    thread([] {
+    // Timer thread to end after 2 minutes
+    thread timer([] {
         this_thread::sleep_for(chrono::minutes(2));
-        declare_winner();
-        }).detach();
+        voting_active = false;
+        });
 
-        while (voting_active) {
-            tcp::socket socket(io_context);
-            acceptor.accept(socket);
-            thread(handle_connection, move(socket)).detach();
-        }
+    while (voting_active) {
+        tcp::socket socket(io_context);
+        acceptor.accept(socket);
+        thread(handle_connection, move(socket)).detach();
+    }
 
-        sqlite3_close(db);
-        return 0;
+    timer.join();
+    declare_winner();
+
+    sqlite3_close(db);
+    return 0;
 }
 
 
