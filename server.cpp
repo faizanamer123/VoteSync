@@ -6,6 +6,7 @@
 #include <mutex>
 #include <thread>
 #include <chrono>
+#include <iomanip>
 
 using boost::asio::ip::tcp;
 using namespace std;
@@ -116,7 +117,7 @@ string process_vote(const string& client_id, const string& candidate) {
     }
     sqlite3_finalize(stmt);
 
-    return "Vote recorded for: " + candidate + "\n" + get_vote_counts();
+    return "Vote recorded for: " + candidate + "\n";
 }
 
 void declare_winner() {
@@ -173,27 +174,44 @@ int main() {
 
     boost::asio::io_context io_context;
     tcp::acceptor acceptor(io_context, tcp::endpoint(tcp::v4(), 54000));
+    acceptor.non_blocking(true);  // Make acceptor non-blocking
 
-    cout << "Voting Server started on port 54000...\nVoting will run for 2 minutes...\n";
+    cout << "Voting Server started on port 54000...\nVoting will run for 1 minute...\n";
+
     auto start_time = chrono::steady_clock::now();
+    const auto voting_duration = chrono::minutes(1);
 
-    // Timer thread to end after 2 minutes
-    thread timer([] {
-        this_thread::sleep_for(chrono::minutes(2));
-        voting_active = false;
-        });
+    int last_printed = -1;
 
-    while (voting_active) {
+    while (chrono::steady_clock::now() - start_time < voting_duration) {
         tcp::socket socket(io_context);
-        acceptor.accept(socket);
-        thread(handle_connection, move(socket)).detach();
+        boost::system::error_code ec;
+
+        // Calculate time left
+        auto now = chrono::steady_clock::now();
+        int seconds_left = chrono::duration_cast<chrono::seconds>(voting_duration - (now - start_time)).count();
+
+        if (seconds_left != last_printed) {
+            cout << "\rTime left: " << setw(3) << seconds_left << "s " << flush;
+            last_printed = seconds_left;
+        }
+
+        acceptor.accept(socket, ec);
+
+        if (!ec) {
+            thread(handle_connection, move(socket)).detach();
+        }
+        else if (ec == boost::asio::error::would_block || ec == boost::asio::error::try_again) {
+            this_thread::sleep_for(chrono::milliseconds(100));
+        }
+        else {
+            cerr << "\nAccept failed: " << ec.message() << "\n";
+        }
     }
 
-    timer.join();
+    voting_active = false;
+    cout << "\rTime left:   0s       \nVoting period over.\n";
     declare_winner();
-
     sqlite3_close(db);
     return 0;
 }
-
-
