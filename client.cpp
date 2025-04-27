@@ -2,41 +2,56 @@
 #include <iostream>
 #include <fstream>
 #include <string>
+#include <thread>
 #include <chrono>
+#include <filesystem>
 
 using boost::asio::ip::tcp;
 using namespace std;
+namespace fs = std::filesystem;
 
-// Generate and persist a unique client ID
 string get_or_create_client_id() {
-    ifstream in("client_id.txt");
+    string filename = "client_id.txt";
+    ifstream in(filename);
     string id;
     if (in >> id) return id;
 
-    // Generate new ID
-    id = "Client_" + to_string(chrono::system_clock::now().time_since_epoch().count());
-    ofstream out("client_id.txt");
+    id = "Client_" + to_string(rand() % 10000);
+    ofstream out(filename);
     out << id;
     return id;
+}
+
+string wait_for_vote() {
+    string vote_file = "vote.txt";
+    while (!fs::exists(vote_file)) {
+        cout << "Waiting for your vote...\n";
+        this_thread::sleep_for(chrono::seconds(1));
+    }
+
+    ifstream in(vote_file);
+    string candidate;
+    getline(in, candidate);
+    return candidate;
+}
+
+void open_browser() {
+    system("start index.html"); // Windows browser launch
 }
 
 int main() {
     try {
         string client_id = get_or_create_client_id();
 
+        open_browser();
+
+        string candidate = wait_for_vote();
+        cout << "You selected: " << candidate << endl;
+
         boost::asio::io_context io_context;
         tcp::socket socket(io_context);
         tcp::resolver resolver(io_context);
         boost::asio::connect(socket, resolver.resolve("127.0.0.1", "54000"));
-
-        cout << "Connected to server.\n";
-        cout << "Your client ID: " << client_id << "\n";
-
-        // Ask user input
-        cout << "Candidates:\n  Alice\n  Bob\n  Charlie\n";
-        string candidate;
-        cout << "Enter candidate to vote for: ";
-        getline(cin, candidate);
 
         string message = client_id + "," + candidate + "\n";
         boost::asio::write(socket, boost::asio::buffer(message));
