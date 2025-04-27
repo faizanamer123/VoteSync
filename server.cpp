@@ -1,217 +1,364 @@
+#include <boost/beast/core.hpp>
+#include <boost/beast/http.hpp>
 #include <boost/asio.hpp>
-#include <iostream>
+#include <boost/config.hpp>
 #include <sqlite3.h>
-#include <vector>
+#include <iostream>
 #include <string>
-#include <mutex>
 #include <thread>
+#include <map>
+#include <set>
+#include <mutex>
 #include <chrono>
-#include <iomanip>
+#include <sstream>
 
-using boost::asio::ip::tcp;
+using tcp = boost::asio::ip::tcp;
+namespace http = boost::beast::http;
 using namespace std;
+using namespace chrono;
 
-mutex db_mutex;
+map<string, string> votes; // client_id -> candidate
+set<string> assigned_ids;
+recursive_mutex mtx;           // General mutex (for votes, clients)
+recursive_mutex db_mutex;      // NEW separate mutex for database access
+
+bool voting_started = false;
+bool voting_ended = false;
+steady_clock::time_point voting_end_time;
+int voting_duration_minutes = 0;
+
+// SQLite database
 sqlite3* db;
-bool voting_active = true;
 
-void initialize_database() {
-    lock_guard<mutex> lock(db_mutex);
-    string sql = R"(
-        CREATE TABLE IF NOT EXISTS candidates (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT UNIQUE NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS votes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            client_id TEXT UNIQUE NOT NULL,
-            candidate TEXT NOT NULL,
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY(candidate) REFERENCES candidates(name)
-        );
-    )";
+// XOR Encryption key
+const char XOR_KEY = 'K';
 
-    char* errmsg;
-    if (sqlite3_exec(db, sql.c_str(), nullptr, nullptr, &errmsg) != SQLITE_OK) {
-        cerr << "Error initializing DB: " << errmsg << endl;
-        sqlite3_free(errmsg);
+// Simple XOR encryption and decryption
+string encrypt(const string& text) {
+    string enc = text;
+    for (char& c : enc) c ^= XOR_KEY;
+    return enc;
+}
+
+string decrypt(const string& enc) {
+    return encrypt(enc);
+}
+
+void initializeDatabase() {
+    if (sqlite3_open("votes.db", &db)) {
+        cerr << "Can't open database: " << sqlite3_errmsg(db) << endl;
+        exit(1);
     }
-
-    vector<string> candidate_names = {
-        "Alice", "Bob", "Charlie", "Diana", "Ethan",
-        "Fiona", "George", "Hannah", "Isaac", "Julia"
-    };
-
-    string candidate_insert = "INSERT OR IGNORE INTO candidates (name) VALUES ";
-    for (size_t i = 0; i < candidate_names.size(); ++i) {
-        candidate_insert += "('" + candidate_names[i] + "')";
-        if (i < candidate_names.size() - 1) candidate_insert += ", ";
-        else candidate_insert += ";";
-    }
-
-    if (sqlite3_exec(db, candidate_insert.c_str(), nullptr, nullptr, &errmsg) != SQLITE_OK) {
-        cerr << "Error inserting candidates: " << errmsg << endl;
-        sqlite3_free(errmsg);
+    const char* sql = "CREATE TABLE IF NOT EXISTS votes (client_id TEXT PRIMARY KEY, candidate TEXT);";
+    char* errMsg = nullptr;
+    if (sqlite3_exec(db, sql, 0, 0, &errMsg) != SQLITE_OK) {
+        cerr << "SQL error: " << errMsg << endl;
+        sqlite3_free(errMsg);
     }
 }
 
-void reset_votes() {
-    lock_guard<mutex> lock(db_mutex);
-    char* errmsg;
-    if (sqlite3_exec(db, "DELETE FROM votes;", nullptr, nullptr, &errmsg) != SQLITE_OK) {
-        cerr << "Error resetting votes: " << errmsg << endl;
-        sqlite3_free(errmsg);
-    }
-}
+void saveVote(const string& client_id, const string& candidate) {
+    lock_guard<recursive_mutex> db_lock(db_mutex);  //  DB lock
 
-string get_vote_counts() {
-    string result = "\nCurrent Vote Counts:\n";
+    string enc_candidate = encrypt(candidate);
+    string sql = "INSERT INTO votes (client_id, candidate) VALUES (?, ?);";
     sqlite3_stmt* stmt;
-    string query = R"(
-        SELECT candidate, COUNT(*) as votes 
-        FROM votes 
-        GROUP BY candidate 
-        ORDER BY votes DESC
-    )";
-    sqlite3_prepare_v2(db, query.c_str(), -1, &stmt, nullptr);
-    while (sqlite3_step(stmt) == SQLITE_ROW) {
-        string candidate = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
-        int count = sqlite3_column_int(stmt, 1);
-        result += "  " + candidate + ": " + to_string(count) + " votes\n";
-    }
-    sqlite3_finalize(stmt);
-    return result;
-}
-
-string process_vote(const string& client_id, const string& candidate) {
-    lock_guard<mutex> lock(db_mutex);
-
-    sqlite3_stmt* stmt;
-    string query;
-
-    query = "SELECT COUNT(*) FROM candidates WHERE name = ?";
-    sqlite3_prepare_v2(db, query.c_str(), -1, &stmt, nullptr);
-    sqlite3_bind_text(stmt, 1, candidate.c_str(), -1, SQLITE_STATIC);
-    if (sqlite3_step(stmt) == SQLITE_ROW && sqlite3_column_int(stmt, 0) == 0) {
-        sqlite3_finalize(stmt);
-        return "Invalid candidate.\n";
-    }
-    sqlite3_finalize(stmt);
-
-    query = "SELECT COUNT(*) FROM votes WHERE client_id = ?";
-    sqlite3_prepare_v2(db, query.c_str(), -1, &stmt, nullptr);
-    sqlite3_bind_text(stmt, 1, client_id.c_str(), -1, SQLITE_STATIC);
-    if (sqlite3_step(stmt) == SQLITE_ROW && sqlite3_column_int(stmt, 0) > 0) {
-        sqlite3_finalize(stmt);
-        return "You have already voted.\n";
-    }
-    sqlite3_finalize(stmt);
-
-    query = "INSERT INTO votes (client_id, candidate) VALUES (?, ?)";
-    sqlite3_prepare_v2(db, query.c_str(), -1, &stmt, nullptr);
-    sqlite3_bind_text(stmt, 1, client_id.c_str(), -1, SQLITE_STATIC);
-    sqlite3_bind_text(stmt, 2, candidate.c_str(), -1, SQLITE_STATIC);
+    sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr);
+    sqlite3_bind_text(stmt, 1, client_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, enc_candidate.c_str(), -1, SQLITE_TRANSIENT);
     if (sqlite3_step(stmt) != SQLITE_DONE) {
-        sqlite3_finalize(stmt);
-        return "Error recording vote.\n";
+        cerr << "Error saving vote." << endl;
     }
     sqlite3_finalize(stmt);
-
-    return "Vote recorded for: " + candidate + "\n";
 }
 
-void declare_winner() {
-    lock_guard<mutex> lock(db_mutex);
-    cout << "\nVoting session ended. Final Results:\n";
-    cout << get_vote_counts();
+map<string, int> countVotes() {
+    lock_guard<recursive_mutex> db_lock(db_mutex);  // 🔥 DB lock
 
+    map<string, int> results;
+    string sql = "SELECT candidate FROM votes;";
     sqlite3_stmt* stmt;
-    string query = R"(
-        SELECT candidate, COUNT(*) as votes 
-        FROM votes 
-        GROUP BY candidate 
-        ORDER BY votes DESC LIMIT 1
-    )";
-    sqlite3_prepare_v2(db, query.c_str(), -1, &stmt, nullptr);
-    if (sqlite3_step(stmt) == SQLITE_ROW) {
-        string winner = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
-        int votes = sqlite3_column_int(stmt, 1);
-        cout << "\nWinner: " << winner << " with " << votes << " votes!\n";
-    }
-    else {
-        cout << "\nNo votes were cast.\n";
+    sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr);
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        string enc_candidate = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+        string candidate = decrypt(enc_candidate);
+        results[candidate]++;
     }
     sqlite3_finalize(stmt);
+    return results;
 }
 
-void handle_connection(tcp::socket socket) {
-    try {
-        boost::asio::streambuf buffer;
-        boost::asio::read_until(socket, buffer, "\n");
+string winner() {
+    auto results = countVotes();
+    string final_winner;
+    int max_votes = 0;
+    vector<string> tied_candidates;
 
-        istream input(&buffer);
-        string client_id, candidate;
-        getline(input, client_id, ',');
-        getline(input, candidate);
+    for (auto& [cand, c] : results) {
+        if (c > max_votes) {
+            max_votes = c;
+            tied_candidates.clear();
+            tied_candidates.push_back(cand);
+        }
+        else if (c == max_votes) {
+            tied_candidates.push_back(cand);
+        }
+    }
 
-        if (!voting_active) {
-            boost::asio::write(socket, boost::asio::buffer("Voting is currently closed.\n"));
+    if (tied_candidates.size() == 1) {
+        return tied_candidates[0];
+    }
+    else if (tied_candidates.size() > 1) {
+        stringstream ss;
+        ss << "Tie between ";
+        for (size_t i = 0; i < tied_candidates.size(); ++i) {
+            ss << tied_candidates[i];
+            if (i != tied_candidates.size() - 1) {
+                ss << " and ";
+            }
+        }
+        return ss.str();
+    }
+
+    return "No votes";
+}
+
+
+string generate_client_id() {
+    static int counter = 1;
+    lock_guard<recursive_mutex> lock(mtx);
+    string id = "client_" + to_string(counter++);
+    assigned_ids.insert(id);
+    return id;
+}
+
+void set_cors_headers(http::response<http::string_body>& res) {
+    res.set(http::field::access_control_allow_origin, "*");
+    res.set(http::field::access_control_allow_methods, "GET, POST, OPTIONS");
+    res.set(http::field::access_control_allow_headers, "Content-Type");
+}
+
+void handle_request(http::request<http::string_body> req, http::response<http::string_body>& res) {
+    if (req.method() == http::verb::options) {
+        res.version(req.version());
+        res.result(http::status::ok);
+        set_cors_headers(res);
+        res.prepare_payload();
+        return;
+    }
+
+    if (req.method() == http::verb::get && req.target() == "/connect") {
+        string client_id = generate_client_id();
+
+        res.version(req.version());
+        res.result(http::status::ok);
+        set_cors_headers(res);
+        res.set(http::field::content_type, "text/plain");
+        res.body() = client_id;
+        res.prepare_payload();
+        return;
+    }
+    else if (req.method() == http::verb::get && req.target() == "/status") {
+        stringstream status;
+        lock_guard<recursive_mutex> lock(mtx);
+        if (!voting_started) {
+            status << "waiting";
+        }
+        else if (voting_started && !voting_ended) {
+            status << "voting";
+            auto now = steady_clock::now();
+            auto seconds_left = duration_cast<seconds>(voting_end_time - now).count();
+            if (seconds_left < 0) seconds_left = 0;
+            status << "|" << seconds_left;
+        }
+        else if (voting_ended) {
+            status << "ended";
+        }
+
+        res.version(req.version());
+        res.result(http::status::ok);
+        set_cors_headers(res);
+        res.set(http::field::content_type, "text/plain");
+        res.body() = status.str();
+        res.prepare_payload();
+        return;
+    }
+    else if (req.method() == http::verb::post && req.target() == "/vote") {
+        auto body = req.body();
+        size_t pos = body.find('&');
+        if (pos != string::npos) {
+            string client_id = body.substr(0, pos);
+            string candidate = body.substr(pos + 1);
+
+            if (candidate.find('=') != string::npos)
+                candidate = candidate.substr(candidate.find('=') + 1);
+
+            {
+                lock_guard<recursive_mutex> lock(mtx);
+                if (votes.count(client_id)) {
+                    res.version(req.version());
+                    res.result(http::status::forbidden);
+                    set_cors_headers(res);
+                    res.set(http::field::content_type, "text/plain");
+                    res.body() = "Already voted!";
+                    res.prepare_payload();
+                    return;
+                }
+                else {
+                    votes[client_id] = candidate;
+                    saveVote(client_id, candidate);
+                }
+            }
+
+            res.version(req.version());
+            res.result(http::status::ok);
+            set_cors_headers(res);
+            res.set(http::field::content_type, "text/plain");
+            res.body() = "Vote recorded!";
+            res.prepare_payload();
             return;
         }
-
-        string response = process_vote(client_id, candidate);
-        boost::asio::write(socket, boost::asio::buffer(response));
     }
-    catch (...) {
-        cerr << "Client handling error.\n";
+    else if (req.method() == http::verb::get && req.target() == "/results") {
+        auto results = countVotes();
+
+        stringstream body;
+        body << "{ \"winner\": \"" << winner() << "\", \"votes\": {";
+
+        bool first = true;
+        for (auto& [cand, c] : results) {
+            if (!first) body << ",";
+            body << "\"" << cand << "\":" << c;
+            first = false;
+        }
+        body << "} }";
+
+        res.version(req.version());
+        res.result(http::status::ok);
+        set_cors_headers(res);
+        res.set(http::field::content_type, "application/json");
+        res.body() = body.str();
+        res.prepare_payload();
+        return;
+    }
+    else if (req.method() == http::verb::get && req.target() == "/stats") {
+        auto results = countVotes();
+
+        stringstream body;
+        body << "{ \"votes\": {";
+
+        bool first = true;
+        for (auto& [cand, c] : results) {
+            if (!first) body << ",";
+            body << "\"" << cand << "\":" << c;
+            first = false;
+        }
+        body << "} }";
+
+        res.version(req.version());
+        res.result(http::status::ok);
+        set_cors_headers(res);
+        res.set(http::field::content_type, "application/json");
+        res.body() = body.str();
+        res.prepare_payload();
+        return;
+    }
+
+    res = http::response<http::string_body>(http::status::not_found, req.version());
+    res.set(http::field::server, "VoteSync-HTTP-Server");
+    set_cors_headers(res);
+    res.set(http::field::content_type, "text/plain");
+    res.body() = "Not Found";
+    res.prepare_payload();
+}
+
+void do_session(tcp::socket socket) {
+    try {
+        boost::beast::flat_buffer buffer;
+
+        while (true) {
+            http::request<http::string_body> req;
+            http::read(socket, buffer, req);
+
+            http::response<http::string_body> res;
+            handle_request(req, res);
+
+            http::write(socket, res);
+        }
+    }
+    catch (exception& e) {
+        cerr << "Session error: " << e.what() << endl;
     }
 }
 
-int main() {
-    sqlite3_open("voting.db", &db);
-    initialize_database();
-    reset_votes();
+void voting_timer() {
+    while (!voting_started) this_thread::sleep_for(chrono::seconds(1));
 
-    boost::asio::io_context io_context;
-    tcp::acceptor acceptor(io_context, tcp::endpoint(tcp::v4(), 54000));
-    acceptor.non_blocking(true);  // Make acceptor non-blocking
+    voting_end_time = steady_clock::now() + minutes(voting_duration_minutes);
 
-    cout << "Voting Server started on port 54000...\nVoting will run for 1 minute...\n";
-
-    auto start_time = chrono::steady_clock::now();
-    const auto voting_duration = chrono::minutes(1);
-
-    int last_printed = -1;
-
-    while (chrono::steady_clock::now() - start_time < voting_duration) {
-        tcp::socket socket(io_context);
-        boost::system::error_code ec;
-
-        // Calculate time left
-        auto now = chrono::steady_clock::now();
-        int seconds_left = chrono::duration_cast<chrono::seconds>(voting_duration - (now - start_time)).count();
-
-        if (seconds_left != last_printed) {
-            cout << "\rTime left: " << setw(3) << seconds_left << "s " << flush;
-            last_printed = seconds_left;
-        }
-
-        acceptor.accept(socket, ec);
-
-        if (!ec) {
-            thread(handle_connection, move(socket)).detach();
-        }
-        else if (ec == boost::asio::error::would_block || ec == boost::asio::error::try_again) {
-            this_thread::sleep_for(chrono::milliseconds(100));
-        }
-        else {
-            cerr << "\nAccept failed: " << ec.message() << "\n";
-        }
+    while (steady_clock::now() < voting_end_time) {
+        this_thread::sleep_for(chrono::seconds(1));
     }
 
-    voting_active = false;
-    cout << "\rTime left:   0s       \nVoting period over.\n";
-    declare_winner();
+    voting_ended = true;
+
+    cout << "\nVoting has ended!\n";
+    cout << "Final Votes:\n";
+    auto results = countVotes();
+    for (auto& [cand, c] : results) {
+        cout << cand << " - " << c << " votes\n";
+    }
+    cout << "Winner: " << winner() << endl;
+}
+
+void clearVotes() {
+    lock_guard<recursive_mutex> db_lock(db_mutex);
+
+    const char* sql = "DELETE FROM votes;";
+    char* errMsg = nullptr;
+    if (sqlite3_exec(db, sql, 0, 0, &errMsg) != SQLITE_OK) {
+        cerr << "Error clearing old votes: " << errMsg << endl;
+        sqlite3_free(errMsg);
+    }
+
+    lock_guard<recursive_mutex> lock(mtx);
+    votes.clear(); // also clear in-memory votes map
+}
+
+
+int main() {
+    try {
+        initializeDatabase();
+
+        boost::asio::io_context io_context;
+
+        cout << "Start voting session? (y/n): ";
+        string start;
+        cin >> start;
+
+        if (start == "y" || start == "Y") {
+            clearVotes(); //  Clear database and in-memory votes
+            cout << "Enter voting duration (minutes): ";
+            cin >> voting_duration_minutes;
+            voting_started = true;
+            thread(voting_timer).detach();
+        }
+
+        tcp::acceptor acceptor(io_context, { tcp::v4(), 8080 });
+
+        cout << "HTTP Voting Server started at http://127.0.0.1:8080\n";
+
+        while (true) {
+            tcp::socket socket(io_context);
+            acceptor.accept(socket);
+            thread(do_session, move(socket)).detach();
+        }
+    }
+    catch (exception& e) {
+        cerr << "Server error: " << e.what() << endl;
+    }
+
     sqlite3_close(db);
+
     return 0;
 }
