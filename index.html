@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>VoteSync - Voting System</title>
+    <link rel="stylesheet" href="style.css">
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(120deg, #a1c4fd 0%, #c2e9fb 100%);
+            height: 100vh;
+            margin: 0;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+
+        #container {
+            background: white;
+            padding: 40px;
+            border-radius: 16px;
+            box-shadow: 0 10px 20px rgba(0,0,0,0.2);
+            text-align: center;
+            width: 320px;
+        }
+
+        h1, h2 {
+            color: #333;
+            margin-bottom: 20px;
+        }
+
+        button {
+            padding: 10px 20px;
+            margin-top: 20px;
+            font-size: 16px;
+            background: #4CAF50;
+            color: white;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: background 0.3s;
+        }
+
+            button:hover {
+                background: #45a049;
+            }
+
+        .hidden {
+            display: none;
+        }
+
+        .screen {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+        }
+
+        #countdownTimer {
+            font-size: 24px;
+            color: #ff5722;
+            margin-top: 20px;
+            animation: pulse 1s infinite;
+        }
+
+        @keyframes pulse {
+            0% {
+                transform: scale(1);
+            }
+
+            50% {
+                transform: scale(1.1);
+            }
+
+            100% {
+                transform: scale(1);
+            }
+        }
+
+        #resultsChart div {
+            margin: 10px 0;
+            padding: 5px;
+            color: white;
+            text-align: left;
+            border-radius: 8px;
+            font-weight: bold;
+        }
+    </style>
+</head>
+
+<body>
+
+    <div id="container">
+
+        <div id="waitingScreen" class="screen">
+            <h1>Waiting for voting session to start...</h1>
+        </div>
+
+        <div id="votingScreen" class="screen hidden">
+            <h1>Vote for Your Candidate</h1>
+            <form id="voteForm">
+                <input type="radio" name="candidate" value="Alice" required> Alice<br>
+                <input type="radio" name="candidate" value="Bob"> Bob<br>
+                <input type="radio" name="candidate" value="Charlie"> Charlie<br>
+                <input type="radio" name="candidate" value="Diana"> Diana<br>
+                <input type="radio" name="candidate" value="Ethan"> Ethan<br><br>
+                <button type="submit">Submit Vote</button>
+            </form>
+        </div>
+
+        <div id="submittedScreen" class="screen hidden">
+            <h1>Your vote has been submitted!</h1>
+            <p id="countdownTimer">Waiting for results...</p>
+            <div id="statsChart" style="width: 100%; margin-top: 20px;"></div> <!-- ADD THIS -->
+        </div>
+
+        <div id="resultsScreen" class="screen hidden">
+            <h1>Voting Results</h1>
+            <h2 id="winnerName"></h2>
+            <div id="resultsChart"></div>
+        </div>
+
+
+    </div>
+
+    <script src="vote.js"></script>
+
+</body>
+</html>
